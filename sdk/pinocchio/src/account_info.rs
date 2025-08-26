@@ -7,7 +7,7 @@ use core::{
     cell::{Cell, UnsafeCell},
     marker::PhantomData,
     mem::ManuallyDrop,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     ptr::{self, NonNull},
     slice::{from_raw_parts, from_raw_parts_mut},
 };
@@ -17,22 +17,14 @@ use core::{
 pub const MAX_PERMITTED_DATA_INCREASE: usize = 1_024 * 10;
 
 /// Represents masks for borrow state of an account.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BorrowState {
-    /// Mask to check whether an account is already borrowed.
-    ///
-    /// This will test both data and lamports borrow state. Any position
-    /// in the borrow byte that is not set means that the account
-    /// is borrowed in that state.
-    Borrowed = 0b_1111_1111,
-
-    /// Mask to check whether an account is already mutably borrowed.
-    ///
-    /// This will test both data and lamports mutable borrow state. If
-    /// one of the mutably borrowed bits is not set, then the account
-    /// is mutably borrowed in that state.
-    MutablyBorrowed = 0b_1000_1000,
+    /// Immutably borrowed.
+    ImmutablyBorrowed,
+    /// Either immutably or mutably borrowed.
+    Borrowed,
+    /// Mutably borrowed.
+    MutablyBorrowed,
 }
 
 #[repr(C)]
@@ -40,36 +32,9 @@ pub enum BorrowState {
 pub(crate) struct AccountStatic {
     /// Borrow state for lamports and account data.
     ///
-    /// This reuses the memory reserved for the duplicate flag in the
-    /// account to track lamports and data borrows. It represents the
-    /// numbers of borrows available.
-    ///
-    /// Bits in the borrow byte are used as follows:
-    ///
-    ///   * lamport mutable borrow flag
-    ///     - `7 6 5 4 3 2 1 0`
-    ///     - `x . . . . . . .`: `1` - the lamport field can be mutably borrowed;
-    ///       `0` - there is an outstanding mutable borrow for the lamports.
-    ///
-    ///   * lamport immutable borrow count
-    ///     - `7 6 5 4 3 2 1 0`
-    ///     - `. x x x . . . .`: number of immutable borrows that can still be
-    ///       allocated, for the lamports field. Ranges from 7 (`111`) to
-    ///       0 (`000`).
-    ///
-    ///   * data mutable borrow flag
-    ///     - `7 6 5 4 3 2 1 0`
-    ///     - `. . . . x . . .`:  `1` - the account data can be mutably borrowed;
-    ///       `0` - there is an outstanding mutable borrow for the account data.
-    ///
-    ///   * data immutable borrow count
-    ///     - `7 6 5 4 3 2 1 0`
-    ///     - `. . . . . x x x`: Number of immutable borrows that can still be
-    ///       allocated, for the account data. Ranges from 7 (`111`) to 0 (`000`).
-    ///
-    /// Note that this values are shared across `AccountInfo`s over the
-    /// same account, e.g., in case of duplicated accounts, they share
-    /// the same borrow state.
+    /// - `if > 1` can be borrowed immutably
+    /// - `if == u8::MAX` can be borrowed mutably
+    /// - `if == 0` borrowed mutably
     pub(crate) borrow_state: Cell<u8>,
 
     /// Indicates whether the transaction was signed by this account.
@@ -297,11 +262,13 @@ impl AccountInfo {
     /// This will test both data and lamports borrow state.
     #[inline(always)]
     pub fn is_borrowed(&self, state: BorrowState) -> bool {
-        let borrow_state = self.raw.borrow_state.get();
-        let mask = state as u8;
-        // If borrow state has any of the state bits of the mask not set,
-        // then the account is borrowed for that state.
-        (borrow_state & mask) != mask
+        match state {
+            BorrowState::ImmutablyBorrowed => {
+                self.raw.borrow_state.get() < u8::MAX && self.raw.borrow_state.get() > 0
+            }
+            BorrowState::Borrowed => self.raw.borrow_state.get() < u8::MAX,
+            BorrowState::MutablyBorrowed => self.raw.borrow_state.get() == 0,
+        }
     }
 
     /// Returns a read-only reference to the data in the account.
@@ -328,22 +295,15 @@ impl AccountInfo {
     }
 
     /// Tries to get a read-only reference to the data field, failing if the field
-    /// is already mutable borrowed or if `7` borrows already exist.
+    /// is already mutable borrowed or if `254` borrows already exist.
     pub fn try_borrow_data(&self) -> Result<Ref<'_, [u8]>, ProgramError> {
-        // check if the account data is already borrowed
         self.can_borrow_data()?;
 
-        let borrow_state = self.raw.borrow_state.get();
-        // Use one immutable borrow for data by subtracting `1` from the data
-        // borrow counter bits; we are guaranteed that there is at least one
-        // immutable borrow available.
-        self.raw.borrow_state.set(borrow_state - 1);
+        self.raw.borrow_state.set(self.raw.borrow_state.get() - 1);
 
-        // return the reference to data
         Ok(Ref {
             value: self.data_ptr(),
             state: &self.raw.borrow_state,
-            borrow_shift: DATA_BORROW_SHIFT,
             marker: PhantomData,
         })
     }
@@ -351,27 +311,19 @@ impl AccountInfo {
     /// Tries to get a mutable reference to the data field, failing if the field
     /// is already borrowed in any form.
     pub fn try_borrow_mut_data(&self) -> Result<RefMut<'_, [u8]>, ProgramError> {
-        // check if the account data is already borrowed
         self.can_borrow_mut_data()?;
 
-        let borrow_state = self.raw.borrow_state.get();
-        // Set the mutable data borrow bit to `0`; we are guaranteed that account
-        // data is not already borrowed in any form.
-        self.raw
-            .borrow_state
-            .set(borrow_state & !DATA_MUTABLE_BORROW_BITMASK);
+        self.raw.borrow_state.set(0);
 
-        // return the mutable reference to data
         Ok(RefMut {
             value: self.data_ptr(),
             state: &self.raw.borrow_state,
-            borrow_bitmask: DATA_MUTABLE_BORROW_BITMASK,
             marker: PhantomData,
         })
     }
 
     /// Checks if it is possible to get a read-only reference to the data field, failing
-    /// if the field is already mutable borrowed or if 7 borrows already exist.
+    /// if the field is already mutable borrowed or if 254 borrows already exist.
     #[deprecated(since = "0.8.4", note = "Use `can_borrow_data` instead")]
     #[inline(always)]
     pub fn check_borrow_data(&self) -> Result<(), ProgramError> {
@@ -379,20 +331,12 @@ impl AccountInfo {
     }
 
     /// Checks if it is possible to get a read-only reference to the data field, failing
-    /// if the field is already mutable borrowed or if 7 borrows already exist.
+    /// if the field is already mutable borrowed or if 254 borrows already exist.
     #[inline(always)]
     pub fn can_borrow_data(&self) -> Result<(), ProgramError> {
         let borrow_state = self.raw.borrow_state.get();
 
-        // Check whether the mutable data borrow bit is already in
-        // use (value `0`) or not. If it is `0`, then the borrow will fail.
-        if borrow_state & DATA_MUTABLE_BORROW_BITMASK == 0 {
-            return Err(ProgramError::AccountBorrowFailed);
-        }
-
-        // Check whether we have reached the maximum immutable data borrow count
-        // or not, i.e., it fails when all immutable data borrow bits are `0`.
-        if borrow_state & IMMUTABLE_LICENCES_MASK == 0 {
+        if borrow_state <= 1 {
             return Err(ProgramError::AccountBorrowFailed);
         }
 
@@ -413,11 +357,7 @@ impl AccountInfo {
     pub fn can_borrow_mut_data(&self) -> Result<(), ProgramError> {
         let borrow_state = self.raw.borrow_state.get();
 
-        // Check whether any (mutable or immutable) data borrow bits are
-        // in use (value `0`) or not.
-        if borrow_state & (IMMUTABLE_LICENCES_MASK | DATA_MUTABLE_BORROW_BITMASK)
-            != (IMMUTABLE_LICENCES_MASK | DATA_MUTABLE_BORROW_BITMASK)
-        {
+        if borrow_state != u8::MAX {
             return Err(ProgramError::AccountBorrowFailed);
         }
 
@@ -605,20 +545,11 @@ impl AccountInfo {
     }
 }
 
-/// Number of bits of the [`Account::borrow_state`] flag to shift to get to
-/// the borrow state bits for account data.
-///   - `7 6 5 4 3 2 1 0`
-///   - `. . . . x x x x`
-const DATA_BORROW_SHIFT: u8 = 0;
-
 /// Reference to account data or lamports with checked borrow rules.
 #[derive(Debug)]
 pub struct Ref<'a, T: ?Sized> {
     value: NonNull<T>,
     state: &'a Cell<u8>,
-    /// Indicates the type of borrow (lamports or data) by representing the
-    /// shift amount.
-    borrow_shift: u8,
     /// The `value` raw pointer is only valid while the `&'a T` lives so we claim
     /// to hold a reference to it.
     marker: PhantomData<&'a T>,
@@ -636,7 +567,6 @@ impl<'a, T: ?Sized> Ref<'a, T> {
         Ref {
             value: NonNull::from(f(&*orig)),
             state: orig.state,
-            borrow_shift: orig.borrow_shift,
             marker: PhantomData,
         }
     }
@@ -655,7 +585,6 @@ impl<'a, T: ?Sized> Ref<'a, T> {
             Ok(value) => Ok(Ref {
                 value: NonNull::from(value),
                 state: orig.state,
-                borrow_shift: orig.borrow_shift,
                 marker: PhantomData,
             }),
             Err(e) => Err((ManuallyDrop::into_inner(orig), e)),
@@ -675,7 +604,6 @@ impl<'a, T: ?Sized> Ref<'a, T> {
             Some(value) => Ok(Ref {
                 value: NonNull::from(value),
                 state: orig.state,
-                borrow_shift: orig.borrow_shift,
                 marker: PhantomData,
             }),
             None => Err(ManuallyDrop::into_inner(orig)),
@@ -683,7 +611,7 @@ impl<'a, T: ?Sized> Ref<'a, T> {
     }
 }
 
-impl<T: ?Sized> core::ops::Deref for Ref<'_, T> {
+impl<T: ?Sized> Deref for Ref<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { self.value.as_ref() }
@@ -693,23 +621,15 @@ impl<T: ?Sized> core::ops::Deref for Ref<'_, T> {
 impl<T: ?Sized> Drop for Ref<'_, T> {
     // decrement the immutable borrow count
     fn drop(&mut self) {
-        self.state.set(self.state.get() + (1 << self.borrow_shift));
+        self.state.set(self.state.get() + 1);
     }
 }
-
-/// Mask representing the mutable borrow flag for data.
-const DATA_MUTABLE_BORROW_BITMASK: u8 = 0b_0000_1000;
-
-const IMMUTABLE_LICENCES_MASK: u8 = 0b_0000_0111;
 
 /// Mutable reference to account data or lamports with checked borrow rules.
 #[derive(Debug)]
 pub struct RefMut<'a, T: ?Sized> {
     value: NonNull<T>,
     state: &'a Cell<u8>,
-    /// Indicates borrowed field (lamports or data) by storing the bitmask
-    /// representing the mutable borrow.
-    borrow_bitmask: u8,
     /// The `value` raw pointer is only valid while the `&'a T` lives so we claim
     /// to hold a reference to it.
     marker: PhantomData<&'a mut T>,
@@ -727,7 +647,6 @@ impl<'a, T: ?Sized> RefMut<'a, T> {
         RefMut {
             value: NonNull::from(f(&mut *orig)),
             state: orig.state,
-            borrow_bitmask: orig.borrow_bitmask,
             marker: PhantomData,
         }
     }
@@ -746,7 +665,6 @@ impl<'a, T: ?Sized> RefMut<'a, T> {
             Ok(value) => Ok(RefMut {
                 value: NonNull::from(value),
                 state: orig.state,
-                borrow_bitmask: orig.borrow_bitmask,
                 marker: PhantomData,
             }),
             Err(e) => Err((ManuallyDrop::into_inner(orig), e)),
@@ -765,7 +683,6 @@ impl<'a, T: ?Sized> RefMut<'a, T> {
             Some(value) => Ok(RefMut {
                 value: NonNull::from(value),
                 state: orig.state,
-                borrow_bitmask: orig.borrow_bitmask,
                 marker: PhantomData,
             }),
             None => Err(ManuallyDrop::into_inner(orig)),
@@ -773,22 +690,21 @@ impl<'a, T: ?Sized> RefMut<'a, T> {
     }
 }
 
-impl<T: ?Sized> core::ops::Deref for RefMut<'_, T> {
+impl<T: ?Sized> Deref for RefMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { self.value.as_ref() }
     }
 }
-impl<T: ?Sized> core::ops::DerefMut for RefMut<'_, T> {
-    fn deref_mut(&mut self) -> &mut <Self as core::ops::Deref>::Target {
+impl<T: ?Sized> DerefMut for RefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
         unsafe { self.value.as_mut() }
     }
 }
 
 impl<T: ?Sized> Drop for RefMut<'_, T> {
     fn drop(&mut self) {
-        // unset the mutable borrow flag
-        self.state.set(self.state.get() | self.borrow_bitmask);
+        self.state.set(u8::MAX);
     }
 }
 
@@ -803,11 +719,10 @@ mod tests {
     #[test]
     fn test_data_ref() {
         let data: [u8; 4] = [0, 1, 2, 3];
-        let state = Cell::new(NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        let state = Cell::new(NOT_BORROWED - 1);
 
         let ref_data = Ref {
             value: NonNull::from(&data),
-            borrow_shift: DATA_BORROW_SHIFT,
             // borrow state must be a mutable reference
             state: &state,
             marker: PhantomData,
@@ -815,32 +730,32 @@ mod tests {
 
         let new_ref = Ref::map(ref_data, |data| &data[1]);
 
-        assert_eq!(state.get(), NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        assert_eq!(state.get(), NOT_BORROWED - 1);
         assert_eq!(*new_ref, 1);
 
         let Ok(new_ref) = Ref::filter_map(new_ref, |_| Some(&3)) else {
             unreachable!()
         };
 
-        assert_eq!(state.get(), NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        assert_eq!(state.get(), NOT_BORROWED - 1);
         assert_eq!(*new_ref, 3);
 
         let Ok(new_ref) = Ref::try_map::<_, u8>(new_ref, |_| Ok(&4)) else {
             unreachable!()
         };
 
-        assert_eq!(state.get(), NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        assert_eq!(state.get(), NOT_BORROWED - 1);
         assert_eq!(*new_ref, 4);
 
         let (new_ref, err) = Ref::try_map::<u8, u8>(new_ref, |_| Err(5)).unwrap_err();
-        assert_eq!(state.get(), NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        assert_eq!(state.get(), NOT_BORROWED - 1);
         assert_eq!(err, 5);
         // Unchanged
         assert_eq!(*new_ref, 4);
 
         let new_ref = Ref::filter_map(new_ref, |_| Option::<&u8>::None);
 
-        assert_eq!(state.get(), NOT_BORROWED - (1 << DATA_BORROW_SHIFT));
+        assert_eq!(state.get(), NOT_BORROWED - 1);
         assert!(new_ref.is_err());
 
         drop(new_ref);
@@ -855,7 +770,6 @@ mod tests {
 
         let ref_data = RefMut {
             value: NonNull::from(&mut data),
-            borrow_bitmask: DATA_MUTABLE_BORROW_BITMASK,
             // borrow state must be a mutable reference
             state: &state,
             marker: PhantomData,
@@ -900,8 +814,8 @@ mod tests {
             (*data_ptr.as_ptr())[0] = 1;
         }
 
-        // Borrow immutable data (7 immutable borrows available).
-        let mut refs = (0..7)
+        // Borrow immutable data (254 immutable borrows available).
+        let mut refs = (0..254)
             .map(|_| MaybeUninit::<Ref<[u8]>>::uninit())
             .collect::<Vec<_>>();
 
