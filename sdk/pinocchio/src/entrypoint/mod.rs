@@ -199,7 +199,7 @@ macro_rules! align_pointer {
     ($ptr:ident) => {
         // integer-to-pointer cast: the resulting pointer will have the same provenance as
         // the original pointer and it follows the alignment requirement for the input.
-        (($ptr as usize + (BPF_ALIGN_OF_U128 - 1)) & !(BPF_ALIGN_OF_U128 - 1)) as *mut u8
+        $ptr.map_addr(|ptr| ((ptr as usize + (BPF_ALIGN_OF_U128 - 1)) & !(BPF_ALIGN_OF_U128 - 1)))
     };
 }
 
